@@ -1,0 +1,26 @@
+
+FROM apache/spark:3.5.4
+
+# 1. Install Hadoop client (exact version used by your HDFS containers)
+ENV HADOOP_VERSION=3.2.1
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends wget ca-certificates; \
+    \
+    wget -q https://archive.apache.org/dist/hadoop/common/hadoop-${HADOOP_VERSION}/hadoop-${HADOOP_VERSION}.tar.gz; \
+    tar -xzf hadoop-${HADOOP_VERSION}.tar.gz -C /opt/; \
+    rm hadoop-${HADOOP_VERSION}.tar.gz; \
+    \
+    apt-get purge -y --auto-remove wget ca-certificates; \
+    rm -rf /var/lib/apt/lists/*
+
+ENV HADOOP_HOME=/opt/hadoop-${HADOOP_VERSION}
+ENV PATH=${PATH}:${HADOOP_HOME}/bin:${HADOOP_HOME}/sbin
+
+# 2. Create HDFS directories **once** at container start
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
+WORKDIR /app
+COPY src /app/src
+ENTRYPOINT ["/docker-entrypoint.sh"]

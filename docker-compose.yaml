@@ -1,0 +1,296 @@
+services:
+  # Kafka Cluster
+  kafka:
+    image: apache/kafka:latest
+    ports:
+      - "9092:9092"
+      - "7071:7071"
+    environment:
+    - KAFKA_CFG_PROCESS_ROLES=controller,broker
+    - KAFKA_CFG_NODE_ID=1
+    - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+    - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
+    - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+    - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+    - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+    - ALLOW_PLAINTEXT_LISTENER=yes
+    - KAFKA_OPTS=-javaagent:/opt/jmx-exporter/jmx_prometheus_javaagent-1.1.0.jar=7071:/opt/jmx-exporter/kafka-jmx-config.yaml
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://kafka:7071/metrics"]
+      interval: 15s
+      timeout: 20s
+      retries: 10
+    volumes:
+      - jmx-exporter:/opt/jmx-exporter
+    depends_on:
+      - jmx-exporter-setup
+
+  jmx-exporter-setup:
+    image: alpine
+    volumes:
+      - jmx-exporter:/opt/jmx-exporter
+    command: >
+      /bin/sh -c "
+        wget -q -O /opt/jmx-exporter/jmx_prometheus_javaagent-1.1.0.jar https://github.com/prometheus/jmx_exporter/releases/download/1.1.0/jmx_prometheus_javaagent-1.1.0.jar &&
+        echo 'startDelaySeconds: 0' > /opt/jmx-exporter/kafka-jmx-config.yaml &&
+        echo 'rules:
+          - pattern: \"kafka.controller<type=KafkaController, name=ActiveControllerCount><>Value\"
+            name: \"kafka_controller_active_controller_count\"
+          - pattern: \"kafka.server<type=BrokerTopicMetrics, name=TopicCount><>Value\"
+            name: \"kafka_topics_count\"
+          - pattern: \"kafka.server<type=BrokerTopicMetrics, name=MessagesInPerSec><>Count\"
+            name: \"kafka_messages_per_sec\"
+          - pattern: \"kafka.server<type=FetcherLagMetrics, name=ConsumerLag, clientId=(.+), topic=(.+), partition=(.+)><>Value\"
+            name: \"kafka_consumer_lag\"' >> /opt/jmx-exporter/kafka-jmx-config.yaml
+      "
+
+  # Kafka UI 
+  kafka-ui:
+    image: tchiotludo/akhq
+    ports:
+      - "8085:8080"
+    environment:
+      AKHQ_CONFIGURATION: |
+        akhq:
+          connections:
+           local:
+             properties:
+               bootstrap.servers: "kafka:9092"
+          security:
+           default:
+              admin:
+                username: admin
+                password: admin
+    depends_on:
+      - kafka
+
+  # Event Generator
+  eventsim:
+    image: khoramism/event-generator-eventsim:1.2
+    environment:
+      - BOOTSTRAP_SERVERS=kafka:9092  # Matches Kafka service name
+      - KEY_SERIALIZER=org.apache.kafka.common.serialization.ByteArraySerializer
+      - VALUE_SERIALIZER=org.apache.kafka.common.serialization.ByteArraySerializer
+      - SECURITY_PROTOCOL=PLAINTEXT
+      - SASL_JAAS_CONFIG=   # Provide an empty value since not using SASL
+      - SASL_MECHANISM=PLAIN  # Define a default value (or empty string) for SASL_MECHANISM
+      - CLIENT_DNS_LOOKUP=use_all_dns_ips
+      - SESSION_TIMEOUT_MS=45000
+      - ACKS=all
+    command: sh -c "sleep 20 && ./bin/eventsim -c configs/Guitar-config.json --continuous --from 200 --nusers 2000 -k 1"
+    depends_on:
+      - kafka
+      
+  # Spark Standalone Cluster
+  spark-master:
+    image: apache/spark:3.5.4
+    ports:
+      - "8080:8080"  # Spark Master UI
+      - "7077:7077"  # Spark Master Port
+      - "4040:4040"  # Spark Application UI
+      - "10000:10000" # for spark-dbt
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_NO_DAEMONIZE=true
+      - SPARK_SSL_ENABLED=no
+      - ENABLE_THRIFT_SERVER=yes # for spark-dbt
+    volumes:
+      - jmx-exporter:/opt/jmx-exporter
+    depends_on:
+      - jmx-exporter-setup
+    command: >
+        /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+        --port 7077
+        --webui-port 8080
+
+
+  spark-worker:
+    image: apache/spark:3.5.4
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=3g
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_NO_DAEMONIZE=true
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    volumes:
+      - jmx-exporter:/tmp/jmx-exporter
+    depends_on:
+      - jmx-exporter-setup
+      - spark-master
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077
+      --cores 2
+      --memory 3g
+      --webui-port 8081
+
+
+  spark-processor:
+    build:
+      context: .
+      dockerfile: Dockerfile.processor
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - HADOOP_CONF_DIR=/opt/hadoop-3.2.1/etc/hadoop
+      - HADOOP_USER_NAME=hdfs          # or root – must exist in HDFS
+    volumes:
+      - ./src:/app/src                 # Live code reload
+    depends_on:
+      - kafka
+      - namenode
+      - datanode
+      - spark-master
+    restart: unless-stopped            # Auto-restart on crash
+    command: >
+      sh -c "
+        spark-submit \
+          --master spark://spark-master:7077 \
+          --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
+          --conf spark.hadoop.fs.defaultFS=hdfs://namenode:9000 \
+          /app/src/kafka_to_hdfs.py
+      "
+
+  dbt-spark:
+    build:
+      context: .
+      dockerfile: Dockerfile.dbt
+    volumes:
+      - ./dbt_project:/usr/app
+    environment:
+      - DBT_PROFILES_DIR=/usr/app
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_THRIFT_SERVER_HOST=spark-master
+      - SPARK_THRIFT_SERVER_PORT=10000
+      # - HADOOP_USER_NAME=root
+      # - HDFS_NAMENODE=namenode:9000
+    depends_on:
+      - spark-master
+
+  # HDFS Cluster
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    ports:
+      - "9870:9870"  # HDFS UI
+      - "9000:9000"
+    volumes:
+      - hadoop_namenode:/hadoop/dfs/name
+    environment:
+      - CLUSTER_NAME=eventsim
+    env_file:
+      - ./hadoop.env
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9870/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    volumes:
+      - hadoop_datanode:/hadoop/dfs/data
+    env_file:
+      - ./hadoop.env
+    depends_on:
+      - namenode
+    environment:
+      - HADOOP_USER_NAME=root
+
+  clickhouse:
+    image: clickhouse:24.9.3
+    depends_on:
+      - kafka
+      - namenode
+      - datanode
+    privileged: true
+    environment:
+      CLICKHOUSE_USER: spotify
+      CLICKHOUSE_PASSWORD: spotify
+      CLICKHOUSE_DB: default
+    volumes:
+      - clickhouse-data-volume:/var/lib/clickhouse/
+      - clickhouse-log-volume:/var/log/clickhouse-server/
+      - ./clickhouse-config.xml:/etc/clickhouse-server/config.d/prometheus.xml
+    ports:
+      - 8123:8123
+      - 9001:9000
+      - 9005:9005
+      - 9363:9363
+    healthcheck:
+      test: [ "CMD-SHELL", "wget -q -O - http://localhost:8123/ping | grep -q Ok. || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  metabase:
+    image: metabase/metabase:v0.52.6
+    container_name: metabase
+    ports:
+      - 3001:3000
+    command: >
+      sh -c "
+      mkdir -p /plugins &&
+      curl -L https://github.com/ClickHouse/metabase-clickhouse-driver/releases/download/1.51.0/clickhouse.metabase-driver.jar -o /plugins/clickhouse-driver.jar &&
+      exec java -jar /app/metabase.jar"
+    environment:
+      MB_PLUGINS_DIR: /plugins
+      MB_DB_FILE: /metabase-data/metabase.db
+    volumes:
+      - metabase-data-volume:/metabase-data
+    depends_on:
+      - clickhouse
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    volumes:
+      - grafana-data:/var/lib/grafana
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - prometheus_data:/prometheus
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - TZ=Asia/Tehran
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    depends_on:
+      - kafka
+    
+
+volumes:
+  jmx-exporter:
+  hadoop_namenode:
+  hadoop_datanode:
+  clickhouse-data-volume:
+  clickhouse-log-volume:
+  metabase-data-volume:
+  grafana-data:
+  prometheus_data:
