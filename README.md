@@ -3,7 +3,7 @@
 <div align="center">
   <img src="images/apache kafka.png" alt="Dashboarding" style="max-width: 100%; height: auto;" />
 </div>
-## Data Pipeline Architecture (Abstract)
+Data Pipeline Architecture (Abstract)
 
 A real-time **spotify content management system** built with **Apache Kafka**, **Spark Structured Streaming**, and **HDFS (Hive-partitioned Parquet)**. Simulated high-volume transaction data (`EventSim`) is ingested via Kafka, processed in micro-batches by Spark, and stored in a **Bronze Layer** (raw but structured) in HDFS using efficient Parquet format with Hive partitioning by date/hour .
 
